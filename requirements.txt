@@ -1,0 +1,10 @@
+aiohttp
+asyncio
+aiocoap
+firebase
+firebase_admin
+netifaces
+aiofiles
+cryptography==3.4.6
+pytz
+tzlocal
