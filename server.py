@@ -13,11 +13,6 @@ import requests
 import shutil
 import sqlite3
 
-# Import per firebase
-import firebase_admin
-from firebase_admin import credentials,storage
-from firebase_admin import firestore
-
 # utility
 import json
 import netifaces
@@ -29,17 +24,8 @@ import time
 #from google.cloud import firestore
 
 # importo file per scrittura dati real time
-from fbrealtime import write_data_to_firebase_realtime, delete_data_from_firebase_realtime
 from configuration_positioning import CalibrateData 
-from database_manager import DatabaseManager  # Importazione della classe DatabaseManager
-
-
-# procedura client firebase
-app_name = "firebase-app"
-cred = credentials.Certificate("config_fb.json")
-options = {
-    'storageBucket': 'nextercare-x.appspot.com'
-}
+from database_manager import DatabaseManager 
 
 context = None
 conn = None
@@ -317,17 +303,6 @@ with open(config_filename) as f:
 	print (f"userid: {config_data}")
 	if(userid != ""): print(f">> Modalità BS02 - ID utente: {userid}")
 	else: print(f">> Modalità Bangles")
- 
-def initialize_firebase_app(cred, app_name, options=None):
-    # Check if the app has already been initialized
-    try:
-        return firebase_admin.get_app(app_name)
-    except ValueError:
-        # If not initialized, then initialize now
-        return firebase_admin.initialize_app(credential=cred, options=options, name=app_name)
-
-firebase_app = initialize_firebase_app(cred, app_name, options)
-firestore_db = firestore.client(app=firebase_app)
 
 def custom_print(message_to_print):
 	current_time = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
@@ -356,7 +331,6 @@ def find_full_mac(last_four):
 
 	return None  # Restituisce None se non trova corrispondenze
 	
-
 def get_user_id(bangle_mac='dummy'):
 	with open(config_filename) as f: 
 		config_data = json.load(f)
@@ -434,23 +408,6 @@ async def coap_brssi(devices):
 		else:
 			request = aiocoap.Message(mtype=aiocoap.NON, code=aiocoap.PUT, payload=ipv6_wpan0_clean.encode(), uri='coap://[ff03::1%wpan0]/banglerssi')
 			context.request(request)
-		
-        #Salva il timestamp dell'invio del comando
-		timestamp = int(datetime.datetime.now().timestamp() * 1000)
-
-		# STOPPATO SALVATAGGIO DEI SINGOLI SEGNALI RICHIESTA RSSI
-		# if os.path.exists(coap_brssi_filename):
-		# 	with open(coap_brssi_filename, 'r') as file:
-		# 		existing_data = json.load(file)
-		# 		# Aggiungi il nuovo timestamp a un array nel JSON
-		# 		existing_data.append({"timestamp": str(timestamp)})
-		# else:
-		# 	existing_data = [{"timestamp": str(timestamp)}]
-
-		# # Salva i dati aggiornati nel file
-		# with open(coap_brssi_filename, 'w') as file:
-		# 	json.dump(existing_data, file, indent=4)
-		# custom_print(f"Timestamp of CoAP request saved: {str(timestamp)}")
   
 	except Exception as e:
 		custom_print('Failed to fetch resource:')
@@ -497,9 +454,479 @@ class AlarmResource(resource.Resource):
 			data = json.loads(ausgabe)
 		except ValueError:
 			custom_print("ERRORE NEL CONVERTIRE JSON RICEVUTO " + ausgabe)
+			# await move_files_out_of_backup()
 			data = ausgabe
-		custom_print('>Receivd: %s' % data)
+		# print(data)
+		# salvo tutti i dati in ricezione da un dispositivo dentro ad un dizionario che verrò gestito successivamente
+		macAdd = data["mac"].split()[0]
+		user_id = get_user_id(macAdd)
+  
+		# carico dati inizio connessione per device O2Ring/PC-60FW
+		if macAdd not in dizionario_globale_timestamp and (data["type"] == 1 or data["type"] == 2 or data["type"] == 0 or data["type"] == 5 or data["type"] == 6 or data["type"] == 7):
+			custom_print("Mac " + macAdd + " not in dizionario_globale_timestamp, adding it for live graph device...")
+			dizionario_globale_timestamp[macAdd] = {
+				"timestampInizio": str(round(datetime.datetime.now().timestamp())),
+				"timestamp": str(round(datetime.datetime.now().timestamp())),
+				"timestampFine": None,
+				"type": data["type"],
+				"mac": macAdd
+			}
+			# carico dati su db livedatabangle
+			insert_data_livedatabangle(conn, dizionario_globale_timestamp[macAdd])
+  
+		if data["status"] == "c":
+			custom_print('>Receivd: %s' % data)
+    
+			try:
+				dizionario_globale[macAdd].append(data)
+			except KeyError:
+				dizionario_globale[macAdd] = []
+				dizionario_globale[macAdd].append(data)
+			data_realtime = {}
+			# scrivo i dati in real time per O2Ring e PC-60FW
+			if data["type"] == 1 or data["type"] == 2:
+				data_realtime = {
+					'hr': data['BPM'],
+					'spO2': data['Ossigeno'],
+     				'timestamp': int(datetime.datetime.now().timestamp() * 1_000_000)
+				}
+				# write_data_to_firebase_realtime(
+				# 	data_realtime, str(user_id) + "/liveMisuration/oximeter")
+			# scrivo i dati in real time per BP2
+			if data["type"] == 0:
+				data_realtime = {
+					'hr': data['BPM'],
+					'DIA': data['DIA'],
+					'SYS': data['SYS'],
+				}
+				# write_data_to_firebase_realtime(
+				# 	data_realtime, str(user_id) + "/liveMisuration/sphygmomanometer")
+			# GESTISCO UPLOAD DEI DATI PER BANGLEJS2
+			if data["type"] == 6:
+				print("> Dati Bangle Arrivati")
+				# mando dati per scrittura su db lite
+				insert_data_bangle(conn, data)
+				result_data_file = {}
+				for k in data.keys():
+					result_data_file[k] = data[k]
+
+				# Gestione speciale per 'rts' se presente e valido, per calcolare il timestamp
+				if 'rts' in data and data['rts'] is not None:
+					result_data_file['timestamp'] = str(int(datetime.datetime.fromtimestamp(
+						int(data['rts']),
+						pytz.timezone('UTC')
+					).astimezone(pytz.timezone('Europe/Rome')).timestamp()))
+     
+				if os.path.exists(config_filename):
+					with open(config_filename, 'r') as file:
+						config = json.load(file)
+					# Passo 2 e 3: Trova il dispositivo e aggiorna il valore di versione
+					device_found = False
+					for device in config.get("devices", []):
+						if device.get("mac") == macAdd and device.get("type") == "banglejs2":
+							device["v"] = str(data['v'])
+							device_found = True
+							break
+
+					if not device_found:
+						custom_print(f"Dispositivo con MAC {macAdd} non trovato nel file config.json")
+					else:
+						# Passo 4: Scrivi la configurazione aggiornata nel file
+						with open(config_filename, 'w') as file:
+							json.dump(config, file, indent=4)
+						custom_print("Configurazione in config.json aggiornata con successo.")
+				else:
+					custom_print("Il file config.json non esiste o non è stato trovato")
+
+				data_formattata = datetime.date.today().strftime("%d-%m-%Y")
+    
+				# Converti il timestamp UNIX (secondi dall'epoca) in un oggetto datetime
+				timestamp = int(data['rts'])
+				ora_italiana = datetime.datetime.fromtimestamp(timestamp, pytz.timezone('Europe/Rome'))
+
+				# Arrotonda l'ora per rimuovere minuti, secondi e microsecondi
+				ora_italiana = ora_italiana.replace(minute=0, second=0, microsecond=0)
+
+				# Converti il timestamp UNIX in un oggetto datetime in UTC
+				ora_utc = datetime.datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.utc)
+
+				# carico dati battiti bangle
+				# if "BPM" in data:
+					# try:
+					# 	# provo ad aggiornare un file già presente per battiti						
+					# 	firestore_db.collection("biometricData/"+str(user_id)+"/watchDevices/hourly/heartRate").document(data_formattata).update(
+					# 		{
+					# 			str(ora_italiana.time().hour).zfill(2) + ":00":
+					# 			{
+					# 				"avgHR": float(data["BPM"]),
+					# 				"count": float(data["nr"]),
+					# 				"maxHR": float(data["M"]),
+					# 				"minHR": float(data["m"]),
+					# 				"timestamp": ora_utc,
+					# 			},
+					# 			"timestamp": ora_utc.replace(hour=0, minute=0, second=0, microsecond=0),
+					# 		})
+					# except:
+					# 	# se non trovato lo creo
+					# 	firestore_db.collection("biometricData/"+str(user_id)+"/watchDevices/hourly/heartRate").document(data_formattata).set(
+					# 		{
+					# 			str(ora_italiana.time().hour).zfill(2) + ":00":
+					# 			{
+					# 				"avgHR": float(data["BPM"]),
+					# 				"count": float(data["nr"]),
+					# 				"maxHR": float(data["M"]),
+					# 				"minHR": float(data["m"]),
+					# 				"timestamp": ora_utc,
+					# 			},
+					# 			"timestamp": ora_utc.replace(hour=0, minute=0, second=0, microsecond=0),
+					# 		})
+					# carico dati passi bangle
+					# try:
+					# 	# provo ad aggiornare un file già presente per battiti						
+					# 	firestore_db.collection("biometricData/"+str(user_id)+"/watchDevices/hourly/steps").document(data_formattata).update(
+					# 		{
+					# 			str(ora_italiana.time().hour).zfill(2) + ":00":
+					# 			{
+					# 				"valueSteps": data["s"],
+					# 				"timestamp": ora_utc,
+					# 			},
+					# 			"timestamp": ora_utc.replace(hour=0, minute=0, second=0, microsecond=0),
+					# 		})
+					# except:
+					# 	# se non trovato lo creo
+					# 	firestore_db.collection("biometricData/"+str(user_id)+"/watchDevices/hourly/steps").document(data_formattata).set(
+					# 		{
+					# 			str(ora_italiana.time().hour).zfill(2) + ":00":
+					# 			{
+					# 				"minHR": data["s"],
+					# 				"timestamp": ora_utc,
+					# 			},
+					# 			"timestamp": ora_utc.replace(hour=0, minute=0, second=0, microsecond=0),
+					# 		})
 		
+					# Aggiornamento dei lastValues
+					# firestore_db.collection("biometricData").document(str(user_id)).update({
+					# 	"lastValues.hr.last": data["BPM"],
+					# 	"lastValues.hr.timestamp": ora_utc,
+					# 	"lastValues.steps.timestamp": ora_utc,
+					# 	# to do: step divisi per ora
+					# })
+				# else:
+				# 	print("BPM does not exist.")
+
+		if data["status"] == "d":
+			# if(str(user_id) != ''): delete_data_from_firebase_realtime(str(user_id) + "/liveMisuration")
+			macAdd = data["mac"].split()[0]
+			custom_print(data)
+			
+   			# carico dati di disconnessione live connection su db 
+			if macAdd in dizionario_globale_timestamp:
+				custom_print("Mac " + macAdd + " not in dizionario_globale_timestamp, adding it for live graph device...")
+				dizionario_globale_timestamp[macAdd] = {
+					"timestampFine": str(round(datetime.datetime.now().timestamp())),
+					"timestamp": str(round(datetime.datetime.now().timestamp())),
+					"timestampInizio": None,
+					"type": data["type"],
+					"mac": macAdd
+				}
+				# carico dati su db livedatabangle
+				insert_data_livedatabangle(conn, dizionario_globale_timestamp[macAdd])
+				del dizionario_globale_timestamp[macAdd]
+   
+			if macAdd in dizionario_globale:
+				custom_print("******************************************")
+				custom_print(data_ora_corrente())
+				custom_print("Uploading data to Cloud from " + macAdd)
+				custom_print("******************************************")
+				# gestione date
+				oggi = datetime.date.today()
+				data_formattata = oggi.strftime("%d-%m-%Y")
+				data_corrente = datetime.date.today()
+				orario_inizio_giornata = datetime.datetime.combine(
+					data_corrente, datetime.time.min)
+				microsecondi_epoch = int(
+					orario_inizio_giornata.timestamp() * 1_000_000)
+
+				# GESTISCO UPLOAD DEI DATI PER BP2 e BP2A (sfigmomanometro)
+				# if data["type"] == 0:
+				# 	try:
+				# 		# provo ad aggiornare un file già presente per battiti
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/bloodPressure").document(data_formattata).update(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.now().time().hour).zfill(2) + ":00":
+				# 				{
+				# 				"DIA": dizionario_globale[macAdd][0]["BPM"], 
+				# 				"SYS": dizionario_globale[macAdd][0]["SYS"], 
+				# 				"timestamp": datetime.datetime.now(),
+				# 				},
+				# 				"timestamp": datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+      
+				# 		# Aggiornamento del valore hr e del timestamp all'interno della mappa lastValues
+				# 		firestore_db.collection("biometricData").document(str(user_id)).update({
+				# 			"lastValues.bloodPressure.DIA": dizionario_globale[macAdd][0]["BPM"],
+       			# 			"lastValues.bloodPressure.SYS": dizionario_globale[macAdd][0]["SYS"],
+				# 			"lastValues.bloodPressure.timestamp": datetime.datetime.now()
+				# 		})
+				# 	except:
+				# 		# se non trovato lo creo
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/bloodPressure").document(data_formattata).set(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.now().time().hour).zfill(2) + ":00":
+				# 				{
+				# 				"DIA": dizionario_globale[macAdd][0]["BPM"], 
+				# 				"SYS": dizionario_globale[macAdd][0]["SYS"], 
+				# 				"timestamp": datetime.datetime.now(),
+				# 				},
+				# 				"timestamp": datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+      
+			
+
+				# GESTISCO UPLOAD DEI DATI PER O2RING e PC-60FW (ossimetri)
+				# if data["type"] == 1 or data["type"] == 2:
+				# 	lista_dati_fb_bpm = []
+				# 	lista_dati_fb_oxy = []
+					
+				# 	try:
+				# 		for elemento in dizionario_globale[macAdd]:
+				# 			lista_dati_fb_bpm.append(elemento['BPM'])
+				# 			lista_dati_fb_oxy.append(elemento['Ossigeno'])
+				# 	except:
+				# 		print("fine comunicazione")
+				# 	try:
+				# 		# provo ad aggiornare un file già presente per battiti
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/heartRate").document(data_formattata).update(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.now().time().hour).zfill(2) + ":00":
+				# 				{
+				# 				"minHR": min(lista_dati_fb_bpm), 
+				# 				"avgHR": round(sum(lista_dati_fb_bpm) / len(lista_dati_fb_bpm), 2), 
+				# 				"maxHR": max(lista_dati_fb_bpm), 
+				# 				"count": len(lista_dati_fb_bpm), 
+				# 				"sumHR": sum(lista_dati_fb_bpm),
+				# 				"timestamp": datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0),
+				# 				},
+				# 				"timestamp": datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+      
+				# 		# Aggiornamento del valore hr e del timestamp all'interno della mappa lastValues
+				# 		firestore_db.collection("biometricData").document(str(user_id)).update({
+				# 			"lastValues.hr.last": round(sum(lista_dati_fb_bpm) / len(lista_dati_fb_bpm), 2),
+				# 			"lastValues.hr.timestamp": datetime.datetime.utcnow()
+				# 		})
+				# 	except:
+				# 		# se non trovato lo creo
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/heartRate").document(data_formattata).set(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.utcnow().time().hour).zfill(2)+":00": 
+				# 				{
+				# 				"minHR": min(lista_dati_fb_bpm), 
+				# 				"avgHR": round(sum(lista_dati_fb_bpm) / len(lista_dati_fb_bpm), 2), 
+				# 				"maxHR": max(lista_dati_fb_bpm), 
+				# 				"count": len(lista_dati_fb_bpm), 
+				# 				"sumHR": sum(lista_dati_fb_bpm),
+				# 				"timestamp": datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+				# 				},
+				# 				"timestamp": datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+					
+				# 	try:
+				# 		# provo ad aggiornare un file già presente per ossigeno
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/spO2").document(data_formattata).update(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.utcnow().time().hour).zfill(2)+":00": 
+				# 				{
+				# 				"minspO2": min(lista_dati_fb_oxy), 
+				# 				"avgspO2": round(sum(lista_dati_fb_oxy) / len(lista_dati_fb_oxy), 2), 
+				# 				"maxspO2": max(lista_dati_fb_oxy), 
+				# 				"count": len(lista_dati_fb_oxy),
+				# 				"sumspO2": sum(lista_dati_fb_bpm), 
+				# 				"timestamp": datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+				# 				},
+				# 				"timestamp": datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+				# 		# Update the lastValue field in the collection
+						
+				# 		# Aggiornamento del solo valore spO2 all'interno della mappa lastValues
+				# 		firestore_db.collection("biometricData").document(str(user_id)).update({
+				# 			"lastValues.spO2.last": round(sum(lista_dati_fb_oxy) / len(lista_dati_fb_oxy), 2),
+				# 			"lastValues.spO2.timestamp": datetime.datetime.utcnow()
+				# 		})
+						
+				# 	except:
+				# 		# se non trovato lo creo
+				# 		firestore_db.collection("biometricData/"+str(user_id)+"/bleDevices/hourly/spO2").document(data_formattata).set(
+				# 			{"idUtente": str(user_id), 
+				# 				str(datetime.datetime.now().time().hour).zfill(2)+":00": 
+				# 				{
+				# 				"minspO2": min(lista_dati_fb_oxy), 
+				# 				"avgspO2": round(sum(lista_dati_fb_oxy) / len(lista_dati_fb_oxy), 2), 
+				# 				"maxspO2": max(lista_dati_fb_oxy), 
+				# 				"count": len(lista_dati_fb_oxy),
+				# 				"sumspO2": sum(lista_dati_fb_bpm), 
+				# 				"timestamp": datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+				# 				},
+				# 				"timestamp": datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 			})
+					
+				# GESTISCO UPLOAD DEI DATI PER I THINGY
+				# if data["type"] == 3:
+				# 	diz_temp = {}
+				# 	for i in dizionario_globale[macAdd]:
+				# 		if 'T' in i:
+				# 			misura = 'T'
+				# 			diz_temp['T'] = i['T']
+				# 		if 'H' in i:
+				# 			misura = 'H'
+				# 			diz_temp['H'] = i['H']
+				# 		if 'P' in i:
+				# 			misura = 'P'
+				# 			diz_temp['P'] = i['P']
+				# 		if 'G' in i:
+				# 			misura = 'G'
+				# 			diz_temp['G'] = i['G']
+				# 		diz_temp['timestamp'] = int(
+				# 			datetime.datetime.now().timestamp() * 1_000_000)
+				# 	try:
+				# 		# provo ad aggiornare un file già presente per la pressione del paziente
+				# 		firestore_db.collection("allDeviceRecordSensoriAria").document(user_id+i["mac"]+data_formattata).update(
+				# 			{"idUtente": user_id, "lastUpdate": int(datetime.datetime.now().timestamp() * 1_000_000), "timestampGiornata": microsecondi_epoch, "location": i["zone"], "mac": i["mac"], str(diz_temp['timestamp']): diz_temp})
+				# 	except:
+				# 		# se non trovato lo creo
+				# 		firestore_db.collection("allDeviceRecordSensoriAria").document(user_id+i["mac"]+data_formattata).set(
+				# 			{"idUtente": user_id, "lastUpdate": int(datetime.datetime.now().timestamp() * 1_000_000), "timestampGiornata": microsecondi_epoch, "location": i["zone"], "mac": i["mac"], str(diz_temp['timestamp']): diz_temp})
+
+
+				# GESTISCO UPLOAD DEI DATI PER BS02 
+				# if data["type"] == 4:
+				# 	# ******************************************************************
+				# 	# PREPARO JSON CONTENENTE DATI BS02 E LO SCRIVO SU FILE LOCALE NEL BR
+				# 	result_data = {'version': data['v'], 'level': data['l'], 'temp': data['t'], 'hum': data['h'], 'mac': data['mac'].split()[0].replace('(', ''), 'timestamp': int(datetime.datetime.now().timestamp() * 1_000_000)}
+				# 	result_data_file = {'c': str(data['c']), 'l': str(data['l']), 't': str(data['t']), 'h': str(data['h']), 'mac': data['mac'].split()[0].replace('(', ''), 'timestamp': str(round(datetime.datetime.now().timestamp()))}
+				# 	await update_ipv6_address(data['mac'].split()[0].replace('(', ''), data['IP'])
+
+				# 	if data['mac'].split()[0].replace('(', '') not in ipv6logs or ipv6logs[data['mac'].split()[0].replace('(', '')] != data['IP']:
+				# 		ipv6logs[data['mac'].split()[0].replace('(', '')] = data['IP']
+				# 		insert_data_logdevices(conn, {
+				# 			"mac": data['mac'].split()[0].replace('(', ''),
+				# 			"type": data['IP'],
+				# 			"timestamp": str(round(datetime.datetime.now().timestamp()))
+				# 		})
+				# 	# print("******ipv6logs*******")
+				# 	# print(ipv6logs)
+				# 	# print("*********************")	
+
+				# 	# salvataggio dati db lite
+				# 	insert_data_bs02(conn, result_data_file)
+					
+				# 	# AGGIORNO LE VERSIONE DEI BS02
+				# 	# Passo 1: Leggi il file config.json
+				# 	if os.path.exists(config_filename):
+				# 		with open(config_filename, 'r') as file:
+				# 			config = json.load(file)
+				# 		# Passo 2 e 3: Trova il dispositivo e aggiorna il valore di versione
+				# 		device_found = False
+				# 		for device in config.get("devices", []):
+				# 			if device.get("mac") == macAdd and device.get("type") == "bs02":
+				# 				device["v"] = str(data['v'])
+				# 				device_found = True
+				# 				break
+
+				# 		if not device_found:
+				# 			print(f"Dispositivo con MAC {macAdd} non trovato nel file config.json")
+				# 		else:
+				# 			# Passo 4: Scrivi la configurazione aggiornata nel file
+				# 			with open(config_filename, 'w') as file:
+				# 				json.dump(config, file, indent=4)
+				# 			print("Configurazione in config.json aggiornata con successo.")
+				# 	else:
+				# 		print("Il file config.json non esiste o non è stato trovato")
+
+				# 	# SCRITTURA SU FB DEI DATI DEL BS02
+				# 	organization_id = get_org_id()
+     
+				# 	# Costruisce il path al documento
+				# 	base_path = "organization/" + str(organization_id)
+
+				# 	# Prova prima con "network"
+				# 	doc_path2 = f"{base_path}/network/{eth0_mac.lower()}/bs02/{result_data['mac']}"
+				# 	doc_ref = firestore_db.document(doc_path2)
+					
+				# 	try:
+				# 		doc = doc_ref.get()
+				# 		if doc.exists:
+				# 			# Il documento esiste, aggiorna
+				# 			path_to_use = doc_path2
+				# 		else:
+				# 			# Prova con "nursery" se "network" non esiste
+				# 			doc_path2 = f"{base_path}/nursery/{eth0_mac.lower()}/bs02/{result_data['mac']}"
+				# 			doc_ref = firestore_db.document(doc_path2)
+				# 			doc = doc_ref.get()
+				# 			if doc.exists:
+				# 				path_to_use = doc_path2
+				# 			else:
+				# 				# Se neanche "nursery" esiste, scegli uno dei due percorsi per creare il documento
+				# 				path_to_use = doc_path2  # O scegliere esplicitamente '/network/' se preferisci
+						
+				# 		# Update the document with the new data
+				# 		firestore_db.document(path_to_use).update({
+				# 			"lastValues": {
+				# 				"version": result_data['version'],
+				# 				"level": result_data['level'],
+				# 				"temp": result_data['temp'],
+				# 				"hum": result_data['hum'],
+				# 				"timestamp": datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+				# 			}
+				# 		})
+				# 		custom_print("Dati BS02 su fb salvati correttamente")
+
+				# 	except Exception as e:
+				# 		print(f"Si è verificato un errore durante il salvataggio dei dati bs02 su FB: {e}")
+      
+					
+				# GESTISCO UPLOAD DEI DATI PER BILANCIA 
+				# if data["type"] == 5:
+				# 	# dati per orario
+				# 	data_odierna = datetime.datetime.now()
+				# 	mezzanotte = datetime.datetime(data_odierna.year, data_odierna.month, data_odierna.day)
+				# 	timestamp_mezzanotte = mezzanotte.timestamp()
+				# 	#
+				# 	ora_formattata = datetime.datetime.now().strftime("%H:%M")
+				# 	document_path = f"biometricData/{user_id}/bleDevices/hourly/weight/{data_formattata}"
+				# 	document_data = {
+				# 		"idUtente": user_id,
+				# 		"timestamp": datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+				# 		ora_formattata: {
+				# 			"weight": float(data["pesoKg"]),
+				# 			"timestamp": datetime.datetime.now().replace(minute=0, second=0, microsecond=0),
+				# 		}
+				# 	}
+     
+				# 	# Aggiornamento del valore hr e del timestamp all'interno della mappa lastValues
+				# 	firestore_db.collection("biometricData").document(str(user_id)).update({
+				# 		"lastValues.weight.last": float(data["pesoKg"]),
+				# 		"lastValues.weight.timestamp": datetime.datetime.now()
+				# 	})
+
+				# 	try:
+				# 		# Prova ad aggiornare il documento
+				# 		firestore_db.collection("biometricData").document(user_id).collection("bleDevices").document("hourly").collection("weight").document(data_formattata).update({
+				# 			ora_formattata: document_data[ora_formattata],
+				# 			"idUtente": document_data["idUtente"],
+				# 			"timestamp": document_data["timestamp"]
+				# 		})
+				# 		print("Dati sul peso aggiornati con successo.")
+				# 	except Exception as e:
+				# 		# Gestisci l'eccezione come necessario
+				# 		firestore_db.collection("biometricData").document(user_id).collection("bleDevices").document("hourly").collection("weight").document(data_formattata).set({
+				# 			ora_formattata: document_data[ora_formattata],
+				# 			"idUtente": document_data["idUtente"],
+				# 			"timestamp": document_data["timestamp"]
+				# 		})
+				# 		print("Dati sul peso creati con successo.")
+				
+				del dizionario_globale[macAdd]
 		return aiocoap.Message(code=aiocoap.CHANGED, payload="")
 
 class NodeIp(resource.Resource):
@@ -726,14 +1153,6 @@ async def get_next_matter_id(do_increment: bool):
 			await f.truncate()
 		return config["current_matter_id"]
 
-async def download_firebase(firebase_storage_path: str, file_path: str):
-	bucket = storage.bucket(app=firebase_app)
-	blob = bucket.blob(firebase_storage_path)
-	if blob.exists():
-		blob.download_to_filename(file_path)
-	else:
-		custom_print('The specified file does not exist in the storage.')
-
 async def send_post_request_async(endpoint, request_data):
     full_url = f"{host_url}{endpoint}"
     async with aiohttp.ClientSession() as session:
@@ -853,23 +1272,6 @@ async def handle(req):
 						custom_print(e)
 						return web.Response(status=500)
   
-		elif req.path == '/banglenotif': # Send notification to bangle passing bangle's mac and a bs02 that has recently seen that bangle
-			cmd = req.query['cmd']
-			mac = req.query['mac']
-			bs02_mac = req.query['bs02_mac']
-			with open(config_filename, "r") as f:
-				config = json.load(f)
-			for device in config["devices"]:
-				if device["mac"] == bs02_mac:
-					request = aiocoap.Message(mtype=aiocoap.NON, code=aiocoap.PUT, payload=str(cmd + "," + mac).encode(), uri='coap://[' + device["ipv6"] + '%wpan0]/bangle')
-					try:
-						context.request(request)
-						return web.Response(status=200)
-					except Exception as e:
-						custom_print('Failed to fetch resource:')
-						custom_print(e)
-						return web.Response(status=500)
-
 		elif req.path == "/setusermode": # empty string = Bangles mode  non empty = BS02 mode -> set general user_id
 			user_mode = req.query.get('user_mode', '')
 			custom_print("Setting user mode...")
@@ -944,8 +1346,6 @@ async def handle(req):
 			banglepuck_mac = req.query['mac']
 			calibrate_mode = req.query.get('calibrate_mode', "0")
 			room = req.query.get('room', 'Unknown')  # Ricava il nome della stanza dalla query
-   
-			
 			
 			CalibrateData().set_current_room(room)
 			CalibrateData().set_current_device(banglepuck_mac)
@@ -1089,7 +1489,6 @@ async def start_api():
 					web.get('/langbangle', handle),
 					web.get('/getupdates', handle),
 					web.get('/buzz', handle),
-					web.get('/banglenotif', handle),
 					web.get('/restart', handle),
 					web.get('/setusermode', handle),
 					web.get('/changeuserid', handle),
