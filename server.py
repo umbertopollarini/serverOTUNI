@@ -1141,18 +1141,6 @@ def get_ipv6_wpan0():
 
 	return None
 
-# Returns (incremented) current matter id
-async def get_next_matter_id(do_increment: bool):
-	async with aiofiles.open(config_filename, mode="r+") as f:
-		content = await f.read()
-		config = json.loads(content)
-		if do_increment:
-			config["current_matter_id"] += 1
-			await f.seek(0)
-			await f.write(json.dumps(config, indent=4))
-			await f.truncate()
-		return config["current_matter_id"]
-
 async def send_post_request_async(endpoint, request_data):
     full_url = f"{host_url}{endpoint}"
     async with aiohttp.ClientSession() as session:
